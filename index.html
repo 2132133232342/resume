@@ -1230,6 +1230,16 @@
             transition: all 0.25s;
         }
         .music-btn:active { transform: scale(0.88); }
+        /* 播放中：外扩脉冲，让状态一眼可见 */
+        .music-btn.is-playing {
+            border-color: rgba(0, 168, 255, 0.45);
+            animation: musicPulse 2s ease-in-out infinite;
+        }
+        @keyframes musicPulse {
+            0%, 100% { box-shadow: 0 0 0 0 rgba(0, 168, 255, 0.4); }
+            50%      { box-shadow: 0 0 0 9px rgba(0, 168, 255, 0); }
+        }
+        body.anim-paused .music-btn.is-playing { animation: none; }
 
         .to-top {
             position: fixed;
@@ -1737,7 +1747,8 @@
 
     <!-- ===== 音乐按钮 ===== -->
     <button class="music-btn" id="musicToggle" aria-label="切换背景音乐">🔊</button>
-    <audio id="bgMusic" src="e.m4a" loop preload="none"></audio>
+    <audio id="bgMusic" src="e.m4a" loop preload="auto" playsinline webkit-playsinline
+           x5-playsinline x5-audio-player-type="h5-page"></audio>
 
     <script>
         (function () {
@@ -2632,44 +2643,114 @@
             // ================================================================
             const audio = document.getElementById('bgMusic');
             const btn = document.getElementById('musicToggle');
-            let playing = false;
 
-            function toggleMusic() {
-                if (playing) {
-                    audio.pause();
-                    playing = false;
-                    btn.textContent = '🔇';
-                } else {
-                    audio.play().then(() => { playing = true; btn.textContent = '🔊'; }).catch(() => { playing = false; btn.textContent = '🔇'; });
+            let wantPlay = false;      // 用户意图：是否希望播放
+            let unlocked = false;      // audio 元素是否已被用户手势激活过
+            let userActed = false;     // 用户是否手动点过按钮（是则不再自动开场）
+            let attempts = 0;          // 自动开场尝试次数
+            const MAX_AUTO_ATTEMPTS = 4;
+
+            function setUI(on) {
+                btn.textContent = on ? '\uD83D\uDD0A' : '\uD83D\uDD07';
+                btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+                btn.classList.toggle('is-playing', on);
+            }
+
+            function play() {
+                return audio.play().then(function () {
+                    unlocked = true;
+                    wantPlay = true;
+                    setUI(true);
+                    return true;
+                }).catch(function () {
+                    // 失败要撤掉意图，否则后续手势会误判为「已在播放」而放弃重试
+                    wantPlay = false;
+                    setUI(false);
+                    return false;
+                });
+            }
+
+            function pause() {
+                wantPlay = false;
+                try { audio.pause(); } catch (e) {}
+                setUI(false);
+            }
+
+            // —— 音乐按钮：唯一的用户意图入口 —— //
+            // 移动端一次点按会依次触发 touchend 与 click，
+            // 全局手势监听必须避开按钮，否则会出现「刚自动播放又被按钮暂停」。
+            let btnGuard = 0;
+            function markBtn() { btnGuard = Date.now(); }
+            btn.addEventListener('touchend', markBtn, { passive: true });
+            btn.addEventListener('click', function (e) {
+                e.stopPropagation();
+                markBtn();
+                userActed = true;
+                detachGesture();
+                if (audio.paused) { play(); } else { pause(); }
+            }, false);
+
+            // —— 首次用户手势自动开场：失败不放弃，下次手势继续重试 —— //
+            const GESTURES = ['touchend', 'click', 'keydown'];
+            let gestureOn = false;
+
+            function onGesture() {
+                if (userActed || wantPlay) { detachGesture(); return; }
+                if (Date.now() - btnGuard < 800) return;   // 刚点过按钮，交给按钮自己处理
+                if (attempts >= MAX_AUTO_ATTEMPTS) { detachGesture(); return; }
+                attempts++;
+                // iOS 忽略 preload，必须在手势内显式 load 才肯播
+                if (!unlocked) { try { audio.load(); } catch (e) {} }
+                play().then(function (ok) { if (ok) detachGesture(); });
+            }
+
+            function attachGesture() {
+                if (gestureOn) return;
+                gestureOn = true;
+                for (let i = 0; i < GESTURES.length; i++) {
+                    document.addEventListener(GESTURES[i], onGesture, { passive: true });
                 }
             }
-            btn.addEventListener('click', (e) => { e.stopPropagation(); toggleMusic(); });
-
-            if (!isMobile) {
-                audio.play().then(() => { playing = true; btn.textContent = '🔊'; }).catch(() => {
-                    playing = false;
-                    btn.textContent = '🔇';
-                    const resume = () => {
-                        if (!playing) { audio.play().then(() => { playing = true; btn.textContent = '🔊'; }).catch(() => {}); }
-                        document.removeEventListener('click', resume);
-                        document.removeEventListener('touchstart', resume);
-                    };
-                    document.addEventListener('click', resume);
-                    document.addEventListener('touchstart', resume);
-                });
-            } else {
-                btn.textContent = '🔇';
-                const resumeM = () => {
-                    if (!playing) { audio.play().then(() => { playing = true; btn.textContent = '🔊'; }).catch(() => {}); }
-                    document.removeEventListener('click', resumeM);
-                    document.removeEventListener('touchstart', resumeM);
-                };
-                document.addEventListener('click', resumeM);
-                document.addEventListener('touchstart', resumeM);
+            function detachGesture() {
+                if (!gestureOn) return;
+                gestureOn = false;
+                for (let i = 0; i < GESTURES.length; i++) {
+                    document.removeEventListener(GESTURES[i], onGesture);
+                }
             }
 
-            document.addEventListener('visibilitychange', () => {
-                if (!document.hidden && playing) audio.play().catch(() => {});
+            setUI(false);
+
+            if (!isMobile) {
+                // 桌面端直接尝试自动播放，被拦截则挂首次手势
+                play().then(function (ok) { if (!ok) attachGesture(); });
+            } else {
+                attachGesture();
+            }
+
+            // 微信内置浏览器：必须等 JSBridge 就绪后才允许播放
+            function wxAutoPlay() { if (!userActed && audio.paused) play(); }
+            try {
+                if (typeof WeixinJSBridge !== 'undefined' && WeixinJSBridge.invoke) {
+                    WeixinJSBridge.invoke('getNetworkType', {}, wxAutoPlay);
+                } else {
+                    document.addEventListener('WeixinJSBridgeReady', function () {
+                        WeixinJSBridge.invoke('getNetworkType', {}, wxAutoPlay);
+                    }, false);
+                }
+            } catch (e) {}
+
+            // 切回前台 / 解锁屏幕后恢复播放
+            document.addEventListener('visibilitychange', function () {
+                if (!document.hidden && wantPlay && audio.paused) play();
+            });
+
+            // 以音频真实事件为准同步 UI（覆盖锁屏、来电、其他音频抢占等情况）
+            audio.addEventListener('play',  function () { setUI(true);  });
+            audio.addEventListener('pause', function () { setUI(false); });
+            audio.addEventListener('error', function () {
+                setUI(false);
+                if (window.console) console.warn('背景音乐加载失败', audio.error && audio.error.code);
             });
 
             // ================================================================
