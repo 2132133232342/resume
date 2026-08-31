@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
     <title>王泽铭 · 个人简历</title>
+    <link rel="icon" href="data:," />
     <style>
         /* ================================================================
                    0. 全局重置 & CSS 变量
@@ -1241,6 +1242,40 @@
         }
         body.anim-paused .music-btn.is-playing { animation: none; }
 
+        /* 未播放时的引导提示：手机浏览器一律禁止自动播放，不提示用户根本不知道要轻触 */
+        .music-hint {
+            position: fixed;
+            z-index: 100;
+            right: 78px;
+            bottom: 26px;
+            padding: 7px 13px;
+            border-radius: 999px;
+            background: rgba(0, 0, 0, 0.62);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.14);
+            color: rgba(255, 255, 255, 0.92);
+            font-size: 0.78rem;
+            letter-spacing: 0.02em;
+            white-space: nowrap;
+            pointer-events: none;
+            opacity: 0;
+            transform: translateX(8px);
+            transition: opacity 0.35s, transform 0.35s;
+        }
+        .music-hint.show {
+            opacity: 1;
+            transform: translateX(0);
+            animation: hintBreath 2.4s ease-in-out infinite;
+        }
+        @keyframes hintBreath {
+            0%, 100% { opacity: 0.7; }
+            50%      { opacity: 1; }
+        }
+        @media (max-width: 768px) {
+            .music-hint { right: 62px; bottom: 20px; font-size: 0.74rem; padding: 6px 11px; }
+        }
+
         .to-top {
             position: fixed;
             z-index: 100;
@@ -1747,6 +1782,7 @@
 
     <!-- ===== 音乐按钮 ===== -->
     <button class="music-btn" id="musicToggle" aria-label="切换背景音乐">🔊</button>
+    <span class="music-hint" id="musicHint" aria-hidden="true"></span>
     <audio id="bgMusic" src="e.m4a" loop preload="auto" playsinline webkit-playsinline
            x5-playsinline x5-audio-player-type="h5-page"></audio>
 
@@ -2648,21 +2684,56 @@
             let unlocked = false;      // audio 元素是否已被用户手势激活过
             let userActed = false;     // 用户是否手动点过按钮（是则不再自动开场）
             let attempts = 0;          // 自动开场尝试次数
-            const MAX_AUTO_ATTEMPTS = 4;
+            let inFlight = false;      // 是否有 play() 正在等结果（防止重入）
+            let didLoad = false;       // 是否已经 load() 过（只做一次）
+            let lastTryAt = 0;         // 上次处理手势的时间戳
+            const MAX_AUTO_ATTEMPTS = 6;
+            // 移动端一次点按会先冒泡 touchend 再触发 click，
+            // 必须把这对事件合并成一次尝试，否则会重复 load() 把已缓冲的数据冲掉（emptied）。
+            const DEDUPE_MS = 700;
+
+            const hint = document.getElementById('musicHint');
+            let hintTimer = null;
+
+            function showHint(text) {
+                if (!hint || userActed) return;
+                hint.textContent = text;
+                hint.classList.add('show');
+                clearTimeout(hintTimer);
+                hintTimer = setTimeout(hideHint, 9000);
+            }
+            function hideHint() {
+                if (!hint) return;
+                hint.classList.remove('show');
+                clearTimeout(hintTimer);
+            }
 
             function setUI(on) {
                 btn.textContent = on ? '\uD83D\uDD0A' : '\uD83D\uDD07';
                 btn.setAttribute('aria-pressed', on ? 'true' : 'false');
                 btn.classList.toggle('is-playing', on);
+                if (on) hideHint();
             }
 
-            function play() {
-                return audio.play().then(function () {
+            // force=true 用于按钮点击：即使用户连点也不该被 inFlight 挡住
+            function play(force) {
+                if (inFlight && !force) return Promise.resolve(false);
+                var ret;
+                try { ret = audio.play(); } catch (e) { inFlight = false; setUI(false); return Promise.resolve(false); }
+                // 老浏览器 play() 不返回 Promise
+                if (!ret || typeof ret.then !== 'function') {
+                    inFlight = false; unlocked = true; wantPlay = true; setUI(true);
+                    return Promise.resolve(true);
+                }
+                inFlight = true;
+                return ret.then(function () {
+                    inFlight = false;
                     unlocked = true;
                     wantPlay = true;
                     setUI(true);
                     return true;
-                }).catch(function () {
+                }, function () {
+                    inFlight = false;
                     // 失败要撤掉意图，否则后续手势会误判为「已在播放」而放弃重试
                     wantPlay = false;
                     setUI(false);
@@ -2686,8 +2757,9 @@
                 e.stopPropagation();
                 markBtn();
                 userActed = true;
+                hideHint();
                 detachGesture();
-                if (audio.paused) { play(); } else { pause(); }
+                if (audio.paused) { play(true); } else { pause(); }
             }, false);
 
             // —— 首次用户手势自动开场：失败不放弃，下次手势继续重试 —— //
@@ -2696,11 +2768,23 @@
 
             function onGesture() {
                 if (userActed || wantPlay) { detachGesture(); return; }
-                if (Date.now() - btnGuard < 800) return;   // 刚点过按钮，交给按钮自己处理
-                if (attempts >= MAX_AUTO_ATTEMPTS) { detachGesture(); return; }
+                var now = Date.now();
+                // 同一次点按的 touchend + click 只算一次尝试
+                if (now - lastTryAt < DEDUPE_MS) return;
+                lastTryAt = now;
+                if (now - btnGuard < 800) return;   // 刚点过按钮，交给按钮自己处理
+                if (attempts >= MAX_AUTO_ATTEMPTS) {
+                    detachGesture();
+                    showHint('点右下角按钮开启音乐');   // 别让用户干瞪眼
+                    return;
+                }
                 attempts++;
-                // iOS 忽略 preload，必须在手势内显式 load 才肯播
-                if (!unlocked) { try { audio.load(); } catch (e) {} }
+                // 只有元素完全没有数据时才 load()，且只做一次。
+                // 重复 load() 会触发 emptied 事件清空已缓冲内容，在移动网络下等于每次从头下载。
+                if (!didLoad && audio.readyState === 0) {
+                    didLoad = true;
+                    try { audio.load(); } catch (e) {}
+                }
                 play().then(function (ok) { if (ok) detachGesture(); });
             }
 
@@ -2726,6 +2810,7 @@
                 play().then(function (ok) { if (!ok) attachGesture(); });
             } else {
                 attachGesture();
+                showHint('轻触屏幕开启音乐');
             }
 
             // 微信内置浏览器：必须等 JSBridge 就绪后才允许播放
